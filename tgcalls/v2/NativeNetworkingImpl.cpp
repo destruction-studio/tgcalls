@@ -25,6 +25,12 @@
 #include "ReflectorPort.h"
 #include "FieldTrialsConfig.h"
 #include "EncryptedConnection.h"
+#include <os/log.h>
+
+static os_log_t tgai_voip_log_ni() {
+    static os_log_t log = os_log_create("com.destruction.tg.ai", "voip");
+    return log;
+}
 
 namespace tgcalls {
 
@@ -608,7 +614,17 @@ void NativeNetworkingImpl::resetDtlsSrtpTransport() {
         candidateFilter &= ~(cricket::CF_REFLEXIVE);
         _portAllocator->SetCandidateFilter(candidateFilter);
     }
-    
+
+    if (_proxy) {
+        rtc::ProxyInfo proxyInfo;
+        proxyInfo.type = rtc::PROXY_SOCKS5;
+        proxyInfo.address = rtc::SocketAddress(_proxy->host, _proxy->port);
+        proxyInfo.username = _proxy->login;
+        proxyInfo.password = rtc::CryptString(CryptStringImpl(_proxy->password));
+        _portAllocator->set_proxy("t/1.0", proxyInfo);
+        os_log(tgai_voip_log_ni(), "[TgAi/voip] relay set_proxy %{public}s:%d", _proxy->host.c_str(), _proxy->port);
+    }
+
     _portAllocator->set_step_delay(cricket::kMinimumStepDelay);
 
     _portAllocator->set_flags(flags);

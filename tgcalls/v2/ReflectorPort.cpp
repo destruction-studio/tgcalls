@@ -25,9 +25,208 @@
 
 #include "RawTcpSocket.h"
 
+#include "rtc_base/proxy_info.h"
+#include "rtc_base/thread.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+#include <thread>
+#include <atomic>
+#include <os/log.h>
+
+static os_log_t tgai_voip_log() {
+    static os_log_t log = os_log_create("com.destruction.tg.ai", "voip");
+    return log;
+}
+#define TGAI_LOG(fmt, ...) os_log(tgai_voip_log(), fmt, ##__VA_ARGS__)
+#define TGAI_ERR(fmt, ...) os_log_error(tgai_voip_log(), fmt, ##__VA_ARGS__)
+
 namespace tgcalls {
 
 namespace {
+
+// rtc::Socket wrapper around a raw POSIX fd with poll thread for event signaling.
+// Fires SignalConnectEvent/SignalReadEvent so AsyncTCPSocketBase (RawTcpSocket) works.
+class RelayTunnelSocket : public rtc::Socket {
+public:
+    RelayTunnelSocket(int fd, const rtc::SocketAddress& remote_addr)
+        : fd_(fd), remote_addr_(remote_addr), owner_thread_(rtc::Thread::Current()),
+          alive_(std::make_shared<std::atomic<bool>>(true)) {
+        poll_thread_ = std::thread(&RelayTunnelSocket::pollLoop, this);
+    }
+
+    ~RelayTunnelSocket() override {
+        *alive_ = false;
+        running_ = false;
+        if (poll_thread_.joinable()) poll_thread_.join();
+        if (fd_ >= 0) ::close(fd_);
+    }
+
+    rtc::SocketAddress GetLocalAddress() const override {
+        sockaddr_in addr = {};
+        socklen_t len = sizeof(addr);
+        if (::getsockname(fd_, (sockaddr*)&addr, &len) == 0) {
+            rtc::SocketAddress a; a.FromSockAddr(addr); return a;
+        }
+        return rtc::SocketAddress();
+    }
+    rtc::SocketAddress GetRemoteAddress() const override {
+        return remote_addr_;
+    }
+    int Bind(const rtc::SocketAddress&) override { return 0; }
+    int Connect(const rtc::SocketAddress&) override { return 0; }
+    int Send(const void* pv, size_t cb) override {
+        int r = ::send(fd_, pv, cb, 0);
+        if (r < 0) {
+            error_ = errno;
+            TGAI_ERR("[TgAi/voip] relay Send failed: %{public}s", strerror(errno));
+        }
+        return r;
+    }
+    int SendTo(const void*, size_t, const rtc::SocketAddress&) override { return -1; }
+    int Recv(void* pv, size_t cb, int64_t* ts) override {
+        if (ts) *ts = -1;
+        int r = ::recv(fd_, pv, cb, 0);
+        if (r < 0) error_ = errno;
+        return r;
+    }
+    int RecvFrom(void*, size_t, rtc::SocketAddress*, int64_t*) override { return -1; }
+    int Listen(int) override { return -1; }
+    rtc::Socket* Accept(rtc::SocketAddress*) override { return nullptr; }
+    int Close() override {
+        *alive_ = false;
+        running_ = false;
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+        return 0;
+    }
+    int GetError() const override { return error_; }
+    void SetError(int e) override { error_ = e; }
+    ConnState GetState() const override { return fd_ >= 0 ? CS_CONNECTED : CS_CLOSED; }
+    int GetOption(Option, int*) override { return -1; }
+    int SetOption(Option opt, int val) override {
+        if (opt == OPT_NODELAY) return setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+        return -1;
+    }
+
+private:
+    void pollLoop() {
+        auto alive = alive_;
+
+        usleep(10000);
+
+        if (owner_thread_) {
+            owner_thread_->PostTask([this, alive]() {
+                if (*alive) {
+                    SignalConnectEvent(this);
+                }
+            });
+        }
+
+        struct pollfd pfd;
+        while (running_) {
+            pfd = {fd_, POLLIN, 0};
+            int ret = ::poll(&pfd, 1, 50);
+            if (ret > 0) {
+                if (pfd.revents & POLLIN) {
+                    if (owner_thread_) {
+                        owner_thread_->PostTask([this, alive]() {
+                            if (*alive) SignalReadEvent(this);
+                        });
+                    }
+                }
+                if (pfd.revents & (POLLERR | POLLHUP)) {
+                    if (owner_thread_) {
+                        owner_thread_->PostTask([this, alive]() {
+                            if (*alive) SignalCloseEvent(this, 0);
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    int fd_;
+    rtc::SocketAddress remote_addr_;
+    int error_ = 0;
+    std::atomic<bool> running_{true};
+    rtc::Thread* owner_thread_;
+    std::thread poll_thread_;
+    std::shared_ptr<std::atomic<bool>> alive_;
+};
+
+// Blocking connect to VoIP TCP-UDP relay. Returns connected fd or -1.
+// Protocol: [1:userLen][user][1:passLen][pass][4:IP BE][2:port BE] -> [1:status]
+static int relayConnectBlocking(const rtc::SocketAddress& relay_addr,
+                                 const std::string& user, const std::string& pass,
+                                 const rtc::SocketAddress& remote,
+                                 int timeout_sec) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    struct timeval tv = {timeout_sec, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    struct sockaddr_in sa = {};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(relay_addr.port());
+    inet_pton(AF_INET, relay_addr.ipaddr().ToString().c_str(), &sa.sin_addr);
+
+    if (::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        TGAI_ERR("[TgAi/voip] relay TCP connect failed: %{public}s", strerror(errno));
+        ::close(fd);
+        return -1;
+    }
+    TGAI_LOG("[TgAi/voip] relay TCP connected");
+
+    uint8_t buf[515];
+    int p = 0;
+    buf[p++] = (uint8_t)user.size();
+    memcpy(buf + p, user.data(), user.size()); p += user.size();
+    buf[p++] = (uint8_t)pass.size();
+    memcpy(buf + p, pass.data(), pass.size()); p += pass.size();
+
+    uint32_t ip = remote.ip();
+    buf[p++] = (ip >> 24) & 0xFF; buf[p++] = (ip >> 16) & 0xFF;
+    buf[p++] = (ip >> 8) & 0xFF;  buf[p++] = ip & 0xFF;
+    uint16_t port = remote.port();
+    buf[p++] = (port >> 8) & 0xFF; buf[p++] = port & 0xFF;
+
+    TGAI_LOG("[TgAi/voip] relay handshake target=%d.%d.%d.%d:%d",
+             (int)buf[p-6], (int)buf[p-5], (int)buf[p-4], (int)buf[p-3], port);
+
+    if (::send(fd, buf, p, 0) != p) {
+        TGAI_ERR("[TgAi/voip] relay handshake send failed");
+        ::close(fd); return -1;
+    }
+
+    // 0x00=OK, 0x01=auth fail, 0x02=UDP fail
+    uint8_t status;
+    if (::recv(fd, &status, 1, MSG_WAITALL) != 1) {
+        TGAI_ERR("[TgAi/voip] relay no response");
+        ::close(fd); return -1;
+    }
+    if (status != 0x00) {
+        TGAI_ERR("[TgAi/voip] relay rejected status=%d", (int)status);
+        ::close(fd); return -1;
+    }
+
+    TGAI_LOG("[TgAi/voip] relay tunnel established to %{public}s", remote.ToString().c_str());
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    return fd;
+}
 
 rtc::CopyOnWriteBuffer parseHex(std::string const &string) {
     rtc::CopyOnWriteBuffer result;
@@ -94,17 +293,38 @@ rtc::AsyncPacketSocket *CreateClientRawTcpSocket(
         RTC_LOG(LS_ERROR) << "Setting TCP_NODELAY option failed with error "
         << socket->GetError();
     }
-    
+
+    if (proxy_info.type == rtc::PROXY_SOCKS5 && !proxy_info.address.IsNil()) {
+        TGAI_LOG("[TgAi/voip] relay connecting via %{public}s to %{public}s",
+                 proxy_info.address.ToString().c_str(), remote_address.ToString().c_str());
+
+        delete socket;
+
+        std::string pass_str;
+        size_t passLen = proxy_info.password.GetLength();
+        pass_str.resize(passLen);
+        proxy_info.password.CopyTo(&pass_str[0], false);
+
+        int fd = relayConnectBlocking(proxy_info.address, proxy_info.username,
+                                       pass_str, remote_address, 10);
+        if (fd < 0) {
+            return NULL;
+        }
+
+        rtc::Socket* tunnelSocket = new RelayTunnelSocket(fd, remote_address);
+        return new rtc::RawTcpSocket(tunnelSocket);
+    }
+
     if (socket->Connect(remote_address) < 0) {
         RTC_LOG(LS_ERROR) << "TCP connect failed with error " << socket->GetError();
         delete socket;
         return NULL;
     }
-    
+
     // Finally, wrap that socket in a TCP or STUN TCP packet socket.
     rtc::AsyncPacketSocket* tcp_socket;
     tcp_socket = new rtc::RawTcpSocket(socket);
-    
+
     return tcp_socket;
 }
 
