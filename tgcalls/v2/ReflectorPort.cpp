@@ -448,13 +448,17 @@ ReflectorPort::~ReflectorPort() {
         Release();
     }
 
+    // TG-FIX: SIGSEGV-reflectorport-dtor — the unsubscribe used to run AFTER `delete socket_`,
+    // calling into the freed socket's callback list (prod SIGSEGV x198). Unsubscribe first,
+    // then delete; also guard against a null socket (GetLocalAddress already assumes it can be).
+    if (socket_ != nullptr && server_address_.proto == cricket::PROTO_TCP) {
+        socket_->UnsubscribeCloseEvent(this);
+    }
+
     if (!SharedSocket()) {
         delete socket_;
     }
-    
-    if (server_address_.proto == cricket::PROTO_TCP) {
-        socket_->UnsubscribeCloseEvent(this);
-    }
+    socket_ = nullptr;
 }
 
 rtc::SocketAddress ReflectorPort::GetLocalAddress() const {
