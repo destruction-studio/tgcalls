@@ -425,7 +425,8 @@ public:
                 },
                 [signalingDataEmitted = _signalingDataEmitted](const std::vector<uint8_t> &data) {
                     signalingDataEmitted(data);
-                }
+                },
+                _encryptionKey.isOutgoing
             );
         }
         if (!_signalingConnection) {
@@ -843,6 +844,9 @@ public:
         _threads->getWorkerThread()->PostTask([weak, call]() {
             auto strong = weak.lock();
             if (!strong) {
+                return;
+            }
+            if (strong->_isStopped.load()) {
                 return;
             }
 
@@ -1452,6 +1456,7 @@ public:
     }
 
     void stop(std::function<void(FinalState)> completion) {
+        _isStopped = true;
         _peerConnection->Close();
 
         FinalState finalState;
@@ -1634,6 +1639,7 @@ private:
     webrtc::scoped_refptr<webrtc::AudioDeviceModule> _audioDeviceModule;
 
     bool _isBatteryLow = false;
+    std::atomic<bool> _isStopped{false};
 
     std::shared_ptr<rtc::VideoSinkInterface<webrtc::VideoFrame>> _currentStrongSink;
 
