@@ -528,19 +528,10 @@ public:
             }
 
             bool isConnected = false;
-            bool isFailed = false;
-
             switch (state) {
-                case webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionConnected: {
-                    isConnected = true;
-                    break;
-                }
+                case webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionConnected:
                 case webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionCompleted: {
                     isConnected = true;
-                    break;
-                }
-                case webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionFailed: {
-                    isFailed = true;
                     break;
                 }
                 default: {
@@ -548,12 +539,11 @@ public:
                 }
             }
 
-            if (strong->_isConnected != isConnected || strong->_isFailed != isFailed) {
-                strong->_isConnected = isConnected;
-                strong->_isFailed = isFailed;
-
-                strong->onNetworkStateUpdated();
+            if (state == webrtc::PeerConnectionInterface::IceConnectionState::kIceConnectionFailed) {
+                strong->maybeRestartIce();
             }
+
+            strong->updateIsConnected(isConnected);
         };
         delegateParameters.onDataChannel = [weak](webrtc::scoped_refptr<webrtc::DataChannelInterface> dataChannel) {
             const auto strong = weak.lock();
@@ -756,6 +746,8 @@ public:
         beginSignaling();
 
         beginLogTimer(0);
+        _lastDisconnectedTimestamp = rtc::TimeMillis();
+        beginCheckConnectionTimer();
     }
 
     void sendPendingSignalingServiceData(int cause) {
@@ -832,6 +824,87 @@ public:
 
             strong->beginLogTimer(1000);
         }, webrtc::TimeDelta::Millis(delayMs));
+    }
+
+    void beginCheckConnectionTimer() {
+        const auto weak = std::weak_ptr<InstanceV2ReferenceImplInternal>(shared_from_this());
+        _threads->getMediaThread()->PostDelayedTask([weak]() {
+            auto strong = weak.lock();
+            if (!strong) {
+                return;
+            }
+            if (strong->_isStopped.load()) {
+                return;
+            }
+
+            int64_t currentTimestamp = rtc::TimeMillis();
+            const int64_t maxTimeout = 20000;
+
+            if (!strong->_isConnected && !strong->_isFailed && strong->_lastDisconnectedTimestamp + maxTimeout < currentTimestamp) {
+                RTC_LOG(LS_INFO) << "InstanceV2ReferenceImpl: connection timeout " << (currentTimestamp - strong->_lastDisconnectedTimestamp) << " ms";
+
+                strong->_isFailed = true;
+                strong->onNetworkStateUpdated();
+            }
+
+            strong->beginCheckConnectionTimer();
+        }, webrtc::TimeDelta::Millis(1000));
+    }
+
+    void updateIsConnected(bool isConnected) {
+        if (_isConnected == isConnected) {
+            return;
+        }
+        _isConnected = isConnected;
+
+        if (isConnected) {
+            onNetworkStateUpdated();
+        } else {
+            _lastDisconnectedTimestamp = rtc::TimeMillis();
+
+            // The legacy ICE state reports kIceConnectionDisconnected on a ~2.5s
+            // receiving timeout, so brief loss blips would surface as Reconnecting
+            // episodes. Only report (and log) the disconnect if it persists.
+            int32_t generation = ++_disconnectReportGeneration;
+            const auto weak = std::weak_ptr<InstanceV2ReferenceImplInternal>(shared_from_this());
+            _threads->getMediaThread()->PostDelayedTask([weak, generation]() {
+                const auto strong = weak.lock();
+                if (!strong) {
+                    return;
+                }
+                if (strong->_isStopped.load()) {
+                    return;
+                }
+                if (generation != strong->_disconnectReportGeneration) {
+                    return;
+                }
+                if (!strong->_isConnected) {
+                    strong->onNetworkStateUpdated();
+                }
+            }, webrtc::TimeDelta::Millis(2000));
+        }
+    }
+
+    void maybeRestartIce() {
+        if (_isFailed) {
+            return;
+        }
+        // Restart only from the offerer side: ICE failure is symmetric, so the
+        // offerer observes it too, and a single restart offer (new ufrag/pwd)
+        // re-pairs both directions without offer glare.
+        if (!_encryptionKey.isOutgoing) {
+            return;
+        }
+
+        int64_t timestamp = rtc::TimeMillis();
+        const int64_t minRestartIntervalMs = 5000;
+        if (_lastIceRestartTimestamp != 0 && _lastIceRestartTimestamp + minRestartIntervalMs > timestamp) {
+            return;
+        }
+        _lastIceRestartTimestamp = timestamp;
+
+        RTC_LOG(LS_INFO) << "InstanceV2ReferenceImpl: requesting ICE restart";
+        _peerConnection->RestartIce();
     }
 
     void writeStateLogRecords() {
@@ -1596,6 +1669,9 @@ private:
 
     bool _isConnected = false;
     bool _isFailed = false;
+    int64_t _lastDisconnectedTimestamp = 0;
+    int32_t _disconnectReportGeneration = 0;
+    int64_t _lastIceRestartTimestamp = 0;
     absl::optional<InstanceNetworking::ConnectionDescription> _currentConnectionDescription;
 
     absl::optional<NetworkStateLogRecord> _currentNetworkStateLogRecord;
