@@ -1034,14 +1034,19 @@ public:
         absl::optional<Proxy> proxy;
         if (_proxy) {
             proxy = *(_proxy.get());
+            RTC_LOG(LS_INFO) << "VoIP-PROXY: proxy configured host=" << _proxy->host << " port=" << _proxy->port;
+        } else {
+            RTC_LOG(LS_INFO) << "VoIP-PROXY: no proxy configured";
         }
 
-        _networking.reset(new ThreadLocalObject<InstanceNetworking>(_threads->getNetworkThread(), [weak, threads = _threads, encryptionKey = _encryptionKey, isOutgoing = _encryptionKey.isOutgoing, enableStunMarking = _enableStunMarking, rtcServers = _rtcServers, proxy, enableP2P = _enableP2P, customParameters = _customParameters]() {
+        bool enableTCP = proxy.has_value();
+        RTC_LOG(LS_INFO) << "VoIP-PROXY: enableTCP=" << enableTCP << " enableP2P=" << _enableP2P << " rtcServers=" << _rtcServers.size();
+        _networking.reset(new ThreadLocalObject<InstanceNetworking>(_threads->getNetworkThread(), [weak, threads = _threads, encryptionKey = _encryptionKey, isOutgoing = _encryptionKey.isOutgoing, enableStunMarking = _enableStunMarking, rtcServers = _rtcServers, proxy, enableP2P = _enableP2P, enableTCP, customParameters = _customParameters]() {
             return std::static_pointer_cast<InstanceNetworking>(std::make_shared<NativeNetworkingImpl>(InstanceNetworking::Configuration{
                 .encryptionKey = encryptionKey,
                 .isOutgoing = isOutgoing,
                 .enableStunMarking = enableStunMarking,
-                .enableTCP = false,
+                .enableTCP = enableTCP,
                 .enableP2P = enableP2P,
                 .rtcServers = rtcServers,
                 .proxy = proxy,
