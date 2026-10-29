@@ -44,6 +44,17 @@ struct Proxy {
 	std::string password;
 };
 
+// TG fork (Task 3096, mirror of desktop 3092): our VoIP relay reuses the SOCKS5
+// proxy plumbing, so the reflector-socket intercept (v2/ReflectorPort.cpp) must
+// tell OUR relay endpoint apart from a user's genuine SOCKS5 call-proxy.
+// VoIPService.java prefixes the relay login (uuid) with this marker; the
+// intercept engages only when the marker is present and strips it back to the
+// uuid. A user's proxy has no marker and falls through to upstream's plain
+// reflector connect (vanilla behavior — the raw reflector leg was never
+// proxied). The leading control byte cannot occur in a real SOCKS5 username,
+// so there is no collision with a user proxy.
+inline constexpr const char *kRelayLoginMarker = "\x01tgrelay\x01";
+
 struct RtcServer {
     uint8_t id = 0;
 	std::string host;

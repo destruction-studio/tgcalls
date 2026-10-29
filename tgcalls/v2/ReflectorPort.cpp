@@ -24,10 +24,314 @@
 #include "rtc_base/byte_order.h"
 
 #include "RawTcpSocket.h"
+#include "Instance.h" // tg-fork (Task 3096): kRelayLoginMarker.
+
+#include "rtc_base/logging.h"
+#include "rtc_base/proxy_info.h"
+#include "rtc_base/thread.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+#include <thread>
+#include <atomic>
 
 namespace tgcalls {
 
 namespace {
+
+// rtc::Socket wrapper around a raw POSIX fd with poll thread for event signaling.
+// Fires SignalConnectEvent/SignalReadEvent so AsyncTCPSocketBase (RawTcpSocket) works.
+class RelayTunnelSocket : public rtc::Socket {
+public:
+    RelayTunnelSocket(int fd, const rtc::SocketAddress& remote_addr)
+        : fd_(fd), remote_addr_(remote_addr), owner_thread_(rtc::Thread::Current()),
+          alive_(std::make_shared<std::atomic<bool>>(true)) {
+        poll_thread_ = std::thread(&RelayTunnelSocket::pollLoop, this);
+    }
+
+    ~RelayTunnelSocket() override {
+        *alive_ = false;
+        running_ = false;
+        if (poll_thread_.joinable()) poll_thread_.join();
+        if (fd_ >= 0) ::close(fd_);
+    }
+
+    rtc::SocketAddress GetLocalAddress() const override {
+        sockaddr_in addr = {};
+        socklen_t len = sizeof(addr);
+        if (::getsockname(fd_, (sockaddr*)&addr, &len) == 0) {
+            rtc::SocketAddress a; a.FromSockAddr(addr); return a;
+        }
+        return rtc::SocketAddress();
+    }
+    rtc::SocketAddress GetRemoteAddress() const override {
+        return remote_addr_;
+    }
+    int Bind(const rtc::SocketAddress&) override { return 0; }
+    int Connect(const rtc::SocketAddress&) override { return 0; }
+    int Send(const void* pv, size_t cb) override {
+        int r = ::send(fd_, pv, cb, MSG_NOSIGNAL);
+        if (r < 0) {
+            error_ = errno;
+            RTC_LOG(LS_ERROR) << "VoIP-RELAY: Send failed: " << strerror(errno);
+        }
+        return r;
+    }
+    int SendTo(const void*, size_t, const rtc::SocketAddress&) override { return -1; }
+    int Recv(void* pv, size_t cb, int64_t* ts) override {
+        if (ts) *ts = -1;
+        int r = ::recv(fd_, pv, cb, 0);
+        if (r < 0) error_ = errno;
+        return r;
+    }
+    int RecvFrom(void*, size_t, rtc::SocketAddress*, int64_t*) override { return -1; }
+    int Listen(int) override { return -1; }
+    rtc::Socket* Accept(rtc::SocketAddress*) override { return nullptr; }
+    int Close() override {
+        *alive_ = false;
+        running_ = false;
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+        return 0;
+    }
+    int GetError() const override { return error_; }
+    void SetError(int e) override { error_ = e; }
+    ConnState GetState() const override { return fd_ >= 0 ? CS_CONNECTED : CS_CLOSED; }
+    int GetOption(Option, int*) override { return -1; }
+    int SetOption(Option opt, int val) override {
+        if (opt == OPT_NODELAY) return setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+        return -1;
+    }
+
+private:
+    void pollLoop() {
+        auto alive = alive_;
+
+        usleep(10000);
+
+        if (owner_thread_) {
+            owner_thread_->PostTask([this, alive]() {
+                if (*alive) {
+                    SignalConnectEvent(this);
+                }
+            });
+        }
+
+        struct pollfd pfd;
+        while (running_) {
+            pfd = {fd_, POLLIN, 0};
+            int ret = ::poll(&pfd, 1, 50);
+            if (ret > 0) {
+                if (pfd.revents & POLLIN) {
+                    if (owner_thread_) {
+                        owner_thread_->PostTask([this, alive]() {
+                            if (*alive) SignalReadEvent(this);
+                        });
+                    }
+                }
+                if (pfd.revents & (POLLERR | POLLHUP)) {
+                    if (owner_thread_) {
+                        owner_thread_->PostTask([this, alive]() {
+                            if (*alive) SignalCloseEvent(this, 0);
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    int fd_;
+    rtc::SocketAddress remote_addr_;
+    int error_ = 0;
+    std::atomic<bool> running_{true};
+    rtc::Thread* owner_thread_;
+    std::thread poll_thread_;
+    std::shared_ptr<std::atomic<bool>> alive_;
+};
+
+// Blocking connect to VoIP TCP→UDP relay. Returns connected fd or -1.
+// Protocol: [1:userLen][user][1:passLen][pass][4:IP][2:port BE] → [1:status]
+static int relayConnectBlocking(const rtc::SocketAddress& relay_addr,
+                                 const std::string& user, const std::string& pass,
+                                 const rtc::SocketAddress& remote,
+                                 int timeout_sec) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    struct timeval tv = {timeout_sec, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    struct sockaddr_in sa = {};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(relay_addr.port());
+    inet_pton(AF_INET, relay_addr.ipaddr().ToString().c_str(), &sa.sin_addr);
+
+    if (::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        RTC_LOG(LS_ERROR) << "VoIP-RELAY: TCP connect failed: " << strerror(errno);
+        ::close(fd);
+        return -1;
+    }
+    RTC_LOG(LS_INFO) << "VoIP-RELAY: TCP connected to relay";
+
+    // Auth + target in one message
+    uint8_t buf[515];
+    int p = 0;
+    buf[p++] = (uint8_t)user.size();
+    memcpy(buf + p, user.data(), user.size()); p += user.size();
+    buf[p++] = (uint8_t)pass.size();
+    memcpy(buf + p, pass.data(), pass.size()); p += pass.size();
+
+    // Target IP (network byte order) + port (big-endian)
+    uint32_t ip = remote.ip();
+    buf[p++] = (ip >> 24) & 0xFF; buf[p++] = (ip >> 16) & 0xFF;
+    buf[p++] = (ip >> 8) & 0xFF;  buf[p++] = ip & 0xFF;
+    uint16_t port = remote.port();
+    buf[p++] = (port >> 8) & 0xFF; buf[p++] = port & 0xFF;
+
+    RTC_LOG(LS_INFO) << "VoIP-RELAY: sending handshake, target="
+                     << (int)buf[p-6] << "." << (int)buf[p-5] << "."
+                     << (int)buf[p-4] << "." << (int)buf[p-3]
+                     << ":" << port;
+
+    if (::send(fd, buf, p, 0) != p) {
+        RTC_LOG(LS_ERROR) << "VoIP-RELAY: handshake send failed";
+        ::close(fd); return -1;
+    }
+
+    // Read 1-byte status: 0x00=OK, 0x01=auth fail, 0x02=UDP fail
+    uint8_t status;
+    if (::recv(fd, &status, 1, MSG_WAITALL) != 1) {
+        RTC_LOG(LS_ERROR) << "VoIP-RELAY: no response from relay";
+        ::close(fd); return -1;
+    }
+    if (status != 0x00) {
+        RTC_LOG(LS_ERROR) << "VoIP-RELAY: relay rejected (status=" << (int)status << ")";
+        ::close(fd); return -1;
+    }
+
+    RTC_LOG(LS_INFO) << "VoIP-RELAY: tunnel established to " << remote.ToString();
+
+    // Switch to non-blocking for WebRTC
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    return fd;
+}
+
+// tg-fork (Task 3096): blocking SOCKS5 CONNECT (RFC 1928/1929) through the
+// user's genuine call-proxy. Vanilla never proxied the raw reflector leg (plain
+// direct connect), but for our users direct reflector TCP is typically blocked
+// (that's why they set a proxy in the first place), so honor the proxy for
+// real. Returns connected pass-through fd (post-handshake) or -1.
+static int socks5ConnectBlocking(const rtc::SocketAddress& proxy_addr,
+                                 const std::string& user, const std::string& pass,
+                                 const rtc::SocketAddress& remote,
+                                 int timeout_sec) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    struct timeval tv = {timeout_sec, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    struct sockaddr_in sa = {};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(proxy_addr.port());
+    if (inet_pton(AF_INET, proxy_addr.ipaddr().ToString().c_str(), &sa.sin_addr) != 1) {
+        RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: proxy address not an IPv4 literal: " << proxy_addr.ToString();
+        ::close(fd); return -1;
+    }
+    if (::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: TCP connect to proxy failed: " << strerror(errno);
+        ::close(fd); return -1;
+    }
+
+    const bool hasAuth = !user.empty() || !pass.empty();
+    uint8_t greet[4];
+    int gp = 0;
+    greet[gp++] = 0x05;
+    greet[gp++] = hasAuth ? 2 : 1;
+    greet[gp++] = 0x00;                    // no-auth
+    if (hasAuth) greet[gp++] = 0x02;       // username/password
+    if (::send(fd, greet, gp, 0) != gp) {
+        RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: greeting send failed";
+        ::close(fd); return -1;
+    }
+    uint8_t method[2];
+    if (::recv(fd, method, 2, MSG_WAITALL) != 2 || method[0] != 0x05) {
+        RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: bad greeting response";
+        ::close(fd); return -1;
+    }
+    if (method[1] == 0x02) {
+        uint8_t auth[513];
+        int ap = 0;
+        auth[ap++] = 0x01;
+        auth[ap++] = (uint8_t)user.size();
+        memcpy(auth + ap, user.data(), user.size()); ap += user.size();
+        auth[ap++] = (uint8_t)pass.size();
+        memcpy(auth + ap, pass.data(), pass.size()); ap += pass.size();
+        if (::send(fd, auth, ap, 0) != ap) {
+            RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: auth send failed";
+            ::close(fd); return -1;
+        }
+        uint8_t authResp[2];
+        if (::recv(fd, authResp, 2, MSG_WAITALL) != 2 || authResp[1] != 0x00) {
+            RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: auth rejected";
+            ::close(fd); return -1;
+        }
+    } else if (method[1] != 0x00) {
+        RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: no acceptable auth method";
+        ::close(fd); return -1;
+    }
+
+    uint8_t req[10];
+    req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x01; // CONNECT, IPv4
+    uint32_t ip = remote.ip();
+    req[4] = (ip >> 24) & 0xFF; req[5] = (ip >> 16) & 0xFF;
+    req[6] = (ip >> 8) & 0xFF;  req[7] = ip & 0xFF;
+    uint16_t port = remote.port();
+    req[8] = (port >> 8) & 0xFF; req[9] = port & 0xFF;
+    if (::send(fd, req, 10, 0) != 10) {
+        RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: CONNECT send failed";
+        ::close(fd); return -1;
+    }
+    uint8_t rep[4];
+    if (::recv(fd, rep, 4, MSG_WAITALL) != 4 || rep[1] != 0x00) {
+        RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: CONNECT rejected (rep=" << (int)rep[1] << ")";
+        ::close(fd); return -1;
+    }
+    // Drain the bound-address tail of the reply.
+    int tail;
+    if (rep[3] == 0x01) tail = 4 + 2;
+    else if (rep[3] == 0x04) tail = 16 + 2;
+    else if (rep[3] == 0x03) {
+        uint8_t dlen;
+        if (::recv(fd, &dlen, 1, MSG_WAITALL) != 1) { ::close(fd); return -1; }
+        tail = dlen + 2;
+    } else { ::close(fd); return -1; }
+    uint8_t skip[262];
+    if (::recv(fd, skip, tail, MSG_WAITALL) != tail) {
+        RTC_LOG(LS_ERROR) << "VoIP-SOCKS5: reply tail read failed";
+        ::close(fd); return -1;
+    }
+
+    RTC_LOG(LS_INFO) << "VoIP-SOCKS5: tunnel established via " << proxy_addr.ToString() << " to " << remote.ToString();
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return fd;
+}
 
 rtc::CopyOnWriteBuffer parseHex(std::string const &string) {
     rtc::CopyOnWriteBuffer result;
@@ -95,16 +399,75 @@ rtc::AsyncPacketSocket *CreateClientRawTcpSocket(
         << socket->GetError();
     }
     
+    // tg-fork (Task 3096, mirror of desktop 3092): engage the TCP→UDP relay
+    // tunnel ONLY for OUR relay endpoint, flagged by kRelayLoginMarker on the
+    // SOCKS5 username (set in VoIPService.java). A user's genuine SOCKS5
+    // call-proxy has no marker and must fall through to the plain reflector
+    // connect below — vanilla never proxied the raw reflector leg. Without
+    // this guard any user SOCKS5 call-proxy would get the relay handshake and
+    // break. Strip the marker back to the uuid before relayConnectBlocking().
+    const std::string relayMarker(kRelayLoginMarker);
+    const bool hasSocks5 = (proxy_info.type == rtc::PROXY_SOCKS5) && !proxy_info.address.IsNil();
+    const bool isOurRelay = hasSocks5 && (proxy_info.username.rfind(relayMarker, 0) == 0);
+    if (isOurRelay) {
+        const std::string uuid = proxy_info.username.substr(relayMarker.size());
+        RTC_LOG(LS_INFO) << "VoIP-RELAY: connecting via relay " << proxy_info.address.ToString()
+                         << " to " << remote_address.ToString();
+
+        delete socket;
+
+        std::string pass_str;
+        size_t passLen = proxy_info.password.GetLength();
+        if (passLen > 0) {
+            pass_str.resize(passLen);
+            proxy_info.password.CopyTo(&pass_str[0], false);
+        }
+
+        int fd = relayConnectBlocking(proxy_info.address, uuid,
+                                       pass_str, remote_address, 10);
+        if (fd < 0) {
+            return NULL;
+        }
+
+        rtc::Socket* tunnelSocket = new RelayTunnelSocket(fd, remote_address);
+        return new rtc::RawTcpSocket(tunnelSocket);
+    }
+
+    if (hasSocks5) {
+        // tg-fork (Task 3096): a user's genuine SOCKS5 call-proxy (no marker) —
+        // tunnel the reflector leg through it with a real SOCKS5 CONNECT.
+        RTC_LOG(LS_INFO) << "VoIP-SOCKS5: user proxy " << proxy_info.address.ToString()
+                         << " -> " << remote_address.ToString();
+
+        delete socket;
+
+        std::string pass_str;
+        size_t passLen = proxy_info.password.GetLength();
+        if (passLen > 0) {
+            pass_str.resize(passLen);
+            proxy_info.password.CopyTo(&pass_str[0], false);
+        }
+
+        int fd = socks5ConnectBlocking(proxy_info.address, proxy_info.username,
+                                       pass_str, remote_address, 10);
+        if (fd < 0) {
+            return NULL;
+        }
+
+        rtc::Socket* tunnelSocket = new RelayTunnelSocket(fd, remote_address);
+        return new rtc::RawTcpSocket(tunnelSocket);
+    }
+
     if (socket->Connect(remote_address) < 0) {
         RTC_LOG(LS_ERROR) << "TCP connect failed with error " << socket->GetError();
         delete socket;
         return NULL;
     }
-    
+
     // Finally, wrap that socket in a TCP or STUN TCP packet socket.
     rtc::AsyncPacketSocket* tcp_socket;
     tcp_socket = new rtc::RawTcpSocket(socket);
-    
+
     return tcp_socket;
 }
 
@@ -224,10 +587,6 @@ resolve_remote_candidate_ip_(resolveRemoteCandidateIp) {
 }
 
 ReflectorPort::~ReflectorPort() {
-    // TODO(juberti): Should this even be necessary?
-
-    // release the allocation by sending a refresh with
-    // lifetime 0.
     if (ready()) {
         Release();
     }
@@ -427,6 +786,8 @@ bool ReflectorPort::CreateReflectorClientSocket() {
 }
 
 void ReflectorPort::OnSocketConnect(rtc::AsyncPacketSocket* socket) {
+    RTC_LOG(LS_INFO) << "VoIP-RELAY: OnSocketConnect called, local="
+                     << socket->GetLocalAddress().ToSensitiveString();
     // This slot should only be invoked if we're using a connection-oriented
     // protocol.
     RTC_DCHECK(server_address_.proto == cricket::PROTO_TCP ||

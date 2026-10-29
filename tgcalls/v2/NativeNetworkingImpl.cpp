@@ -589,18 +589,31 @@ void NativeNetworkingImpl::resetDtlsSrtpTransport() {
         cricket::PORTALLOCATOR_ENABLE_IPV6 |
         cricket::PORTALLOCATOR_ENABLE_IPV6_ON_WIFI;
 
+    RTC_LOG(LS_INFO) << "VoIP-PROXY: NativeNetworkingImpl flags setup — enableTCP=" << _enableTCP << " enableP2P=" << _enableP2P << " hasProxy=" << _proxy.has_value();
+
     if (!_enableTCP) {
         flags |= cricket::PORTALLOCATOR_DISABLE_TCP;
     }
-    
+
     if (_proxy || !_enableP2P) {
         flags |= cricket::PORTALLOCATOR_DISABLE_UDP;
         flags |= cricket::PORTALLOCATOR_DISABLE_STUN;
         uint32_t candidateFilter = _portAllocator->candidate_filter();
         candidateFilter &= ~(cricket::CF_REFLEXIVE);
         _portAllocator->SetCandidateFilter(candidateFilter);
+        RTC_LOG(LS_INFO) << "VoIP-PROXY: disabled UDP+STUN (proxy=" << _proxy.has_value() << " p2p=" << _enableP2P << ")";
     }
-    
+
+    if (_proxy) {
+        rtc::ProxyInfo proxyInfo;
+        proxyInfo.type = rtc::ProxyType::PROXY_SOCKS5;
+        proxyInfo.address = rtc::SocketAddress(_proxy->host, _proxy->port);
+        proxyInfo.username = _proxy->login;
+        proxyInfo.password = rtc::CryptString(CryptStringImpl(_proxy->password));
+        _portAllocator->set_proxy("t/1.0", proxyInfo);
+        RTC_LOG(LS_INFO) << "VoIP-PROXY: set_proxy SOCKS5 " << _proxy->host << ":" << _proxy->port;
+    }
+
     _portAllocator->set_step_delay(cricket::kMinimumStepDelay);
 
     _portAllocator->set_flags(flags);
