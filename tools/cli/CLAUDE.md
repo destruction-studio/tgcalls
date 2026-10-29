@@ -6,7 +6,7 @@ In-process test harness for tgcalls. See the root `CLAUDE.md` for build instruct
 
 | Version | Implementation | Notes |
 |---|---|---|
-| `14.0.0` | `InstanceV2CompatImpl` | WebRTC PeerConnection + V2Impl signaling. Cross-version interop with 7.0.0–13.0.0 |
+| `14.0.0` | `InstanceV2CompatImpl` | WebRTC PeerConnection speaking V2Impl's channel protocol; interoperates with 7.0.0–13.0.0 and itself (rewritten 2026-10-11, see `submodules/TgVoipWebrtc/CLAUDE.md`) |
 | `13.0.0` (default) | `InstanceV2Impl` | Also: 7.0.0, 8.0.0, 9.0.0, 12.0.0 |
 | `11.0.0` | `InstanceV2ReferenceImpl` | Also: 10.0.0. Uses WebRTC PeerConnection |
 | `5.0.0` | `InstanceImpl` (v1) | Also: 2.7.7. Legacy |
@@ -15,7 +15,9 @@ In-process test harness for tgcalls. See the root `CLAUDE.md` for build instruct
 - Two `tgcalls::Instance` objects (caller + callee) created via `Meta::Create(version, ...)`
 - Signaling bridged via `SignalingBridge` with configurable drop rate and delay
 - Group participant logs (`/tmp/tgcalls_group_p<id>_<pid>.log`) are written at stop and unlinked after validation; set `TGCALLS_CLI_KEEP_LOGS=1` to keep them (added 2026-09-17).
-- `--video` in p2p/reflector mode attaches a `tgcalls::VideoCaptureInterface::Create(threads, ...)` to BOTH descriptors (`descriptor.videoCapture`, the iOS join-time path: camera already on when the call is created). Added 2026-09-17 to reproduce the 18/19 start-glare renegotiation loop; a healthy video call shows 4 `SetLocalDescription` in the `--log-file`, no `SetLocalDescription failed`, one `Creating data channel`. Combine with `--delay 100-300` for field-like signaling latency.
+- `--video` in p2p/reflector mode attaches a `tgcalls::VideoCaptureInterface::Create(threads, ...)` to BOTH descriptors (`descriptor.videoCapture`, the iOS join-time path: camera already on when the call is created). Added 2026-09-17 to reproduce the 18/19 start-glare renegotiation loop; a healthy video call shows 2 `Calling SetLocalDescription` in the `--log-file` for 11.0.0 (one per side since the 2026-10-12 one-round negotiation; 4 for 18/19), no `SetLocalDescription failed`, one `Creating data channel`. Combine with `--delay 100-300` for field-like signaling latency.
+- `--video-late-caller-ms N` / `--video-late-callee-ms N` attach that side's capture N ms after the instances are created (the other side gets none unless it has its own value): the Android app's shape, where the camera reaches the engine while the first offer is in flight. `run-negotiation-tests.sh` (2026-10-12) uses them with `network_reference_immediate_capture_renegotiation` to reproduce the late-camera DTLS failure and pins the one-round negotiation (see the tgcalls `CLAUDE.md`).
+- `--video-late` attaches the same captures mid-call via `setVideoCapture` (callee at 3 s, caller at 5 s). With either flag both instances get a `FakeVideoSink` (`setIncomingVideoOutput`) and the summary prints the decoded frames each side received; `remoteMediaStateUpdated` is counted per side. Both are informational, not pass criteria.
 - `FakeAudioDeviceModule` with `SineRecorder` (440Hz tone) and `NoOpRenderer` (audio discarded; validation via BWE)
 - `FakeInterface` platform implementation (pure C++, no iOS/ObjC deps)
 - Stats log validation: both caller and callee write `config.statsLogPath` with bitrate records; non-empty log with at least one non-zero BWE value is a success condition
